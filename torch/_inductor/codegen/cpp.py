@@ -2007,9 +2007,27 @@ class CppKernel(Kernel):
     def codegen_loops_impl(self, loop_nest, code, worksharing):
         threads = parallel_num_threads()
         assert self.call_ranges is not None
-        par_depth = self.decide_parallel_depth(
-            self.call_ranges[: loop_nest.max_parallel_depth()], threads
-        )
+
+        def get_outer_loop_fused_kernel(loop_nest):
+            # Since OuterLoopFusedKernel has no main/tail loop split at any
+            # outer loop fusion depth, len(loop_nest.root) must equal to 1.
+            if loop_nest.root and len(loop_nest.root) == 1:
+                kernels = loop_nest.root[0].get_kernels()
+                if any(isinstance(kernel, OuterLoopFusedKernel) for kernel in kernels):
+                    assert len(kernels) == 1
+                    return kernels[0]
+            return None
+
+        if kernel := get_outer_loop_fused_kernel(loop_nest):
+            assert isinstance(kernel, OuterLoopFusedKernel)
+            par_depth = kernel.decide_parallel_depth(
+                loop_nest.max_parallel_depth(), threads
+            )
+        else:
+            par_depth = self.decide_parallel_depth(
+                self.call_ranges[: loop_nest.max_parallel_depth()], threads
+            )
+
         with contextlib.ExitStack() as stack:
             if par_depth:
                 if loop_nest.is_reduction_only():
@@ -3564,6 +3582,24 @@ class OuterLoopFusedKernel(CppKernel):
     def __init__(self, kernel_group):
         super().__init__(kernel_group.args, kernel_group.ws.num_threads)
         self.inner: List["LoopLevel"] = []
+
+    def decide_parallel_depth(self, outer_loop_fusion_depth, threads) -> int:
+        kernels_parallel_depth = []
+        nested_kernels: List[List[CppKernel]] = [
+            loop.get_kernels() for loop in self.inner
+        ]
+        for kernels in nested_kernels:
+            # For any ScalarKernel, VecKernel, or Tile2DKernel,
+            # they should all have the same call_ranges
+            call_ranges = kernels[0].call_ranges
+            assert all(kernel.call_ranges == call_ranges for kernel in kernels)
+            kernels_parallel_depth.append(
+                kernels[0].decide_parallel_depth(call_ranges, threads)
+            )
+        return min(
+            outer_loop_fusion_depth,
+            max(kernels_parallel_depth),
+        )
 
 
 class ReasonFusedNodes(Enum):
